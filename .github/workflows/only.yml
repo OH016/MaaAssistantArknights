@@ -78,7 +78,7 @@ jobs:
     runs-on: ubuntu-22.04
     strategy:
       matrix:
-        arch: [aarch64, x86_64]
+        arch: [x86_64]
     permissions:
       actions: write
     steps:
@@ -148,14 +148,6 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: assets
-
-      - name: Cleanup files
-        run: |
-          mv -vf assets/changelog/* .
-          rm -rf assets/MAACore-macos-*
-          cd assets
-          # find . -type f | xargs mv -fvt .
-          find . -type f | while read f; do mv -fvt . $f; done
 
       - name: Release to Github
         uses: softprops/action-gh-release@v2.3.2
