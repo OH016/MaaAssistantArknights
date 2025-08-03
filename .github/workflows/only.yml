@@ -1,0 +1,181 @@
+name: ci
+
+on:
+  push:
+    tags:
+      - "v*"
+    branches-ignore:
+      - "master"
+    paths:
+      - "3rdparty/include/**"
+      - "include/**"
+      - "src/**"
+      - "cmake/**"
+      - "CMakeLists.txt"
+      - "MAA.sln"
+      - ".github/workflows/ci.yml"
+      - "!**/*.md"
+  pull_request:
+    branches:
+      - "dev"
+    paths:
+      - "3rdparty/include/**"
+      - "include/**"
+      - "src/**"
+      - "cmake/**"
+      - "CMakeLists.txt"
+      - "MAA.sln"
+      - "!**/*.md"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  meta:
+    # Prevent duplicate runs on organization branches with PRs
+    if: github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name !=
+      github.event.pull_request.base.repo.full_name
+
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.set_tag.outputs.tag }}
+      prerelease: ${{ steps.set_pre.outputs.prerelease }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          path: temp
+          show-progress: false
+
+      - name: Fetch history
+        if: ${{ !startsWith(github.ref, 'refs/pull/') }}
+        run: |
+          git init
+          cp $GITHUB_WORKSPACE/temp/.git/config ./.git
+          rm -rf $GITHUB_WORKSPACE/temp
+          # git config remote.origin.fetch '+refs/*:refs/*'
+          git fetch --filter=tree:0 # --update-head-ok
+          git reset --hard origin/$(git branch --show-current) || true
+          git checkout ${{ github.ref_name }}
+
+      - name: Set tag
+        id: set_tag
+        run: |
+          ${{ startsWith(github.ref, 'refs/pull/') && 'cd temp' || '' }}
+          echo tag=$(git describe --tags --match "v*" ${{ github.ref }} || git rev-parse --short HEAD) | tee -a $GITHUB_OUTPUT
+          exit ${PIPESTATUS[0]}
+
+      - name: Judge pre-release
+        id: set_pre
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          if [[ '${{ steps.set_tag.outputs.tag }}' =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo prerelease=false | tee -a $GITHUB_OUTPUT
+          else
+            echo prerelease=true | tee -a $GITHUB_OUTPUT
+          fi
+
+  ubuntu:
+    # Prevent duplicate runs on organization branches with PRs
+    if: github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name !=
+      github.event.pull_request.base.repo.full_name
+
+    needs: meta
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        arch: [aarch64, x86_64]
+    permissions:
+      actions: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          show-progress: false
+
+      - name: Fetch submodules
+        run: |
+          git submodule update --init --depth 1 3rdparty/EmulatorExtras
+          git submodule update --init --depth 1 src/maa-cli
+
+      - name: Install cross compile toolchains
+        if: ${{ matrix.arch != 'x86_64' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install g++-12-aarch64-linux-gnu g++-12-aarch64-linux-gnu
+
+      # Caching not necessary on ubuntu runner
+      - name: Bootstrap MaaDeps
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 maadeps-download.py ${{ matrix.arch == 'x86_64' && 'x64' || 'arm64' }}-linux
+
+      - name: Build MAA
+        run: |
+          mkdir -p build
+          cmake -B build \
+            -DCMAKE_COMPILE_WARNING_AS_ERROR=ON \
+            -DMAADEPS_TRIPLET='maa-${{ matrix.arch == 'x86_64' && 'x64' || 'arm64' }}-linux' \
+            -DINSTALL_THIRD_LIBS=ON \
+            -DINSTALL_RESOURCE=ON \
+            -DINSTALL_PYTHON=ON \
+            -DMAA_VERSION='${{ needs.meta.outputs.tag }}'
+          cmake --build build --parallel $(nproc --all)
+
+          mkdir -p install
+          cmake --install build --prefix install
+        env:
+          CC: ${{ matrix.arch == 'x86_64' && 'gcc-12' || 'aarch64-linux-gnu-gcc-12' }}
+          CXX: ${{ matrix.arch == 'x86_64' && 'g++-12' || 'aarch64-linux-gnu-g++-12' }}
+          CMAKE_COLOR_DIAGNOSTICS: ON
+          CLICOLOR_FORCE: 1
+          CXXFLAGS: | # workaround for gcc bugs
+            -Wno-error=restrict -Wno-error=array-bounds -Wno-error=stringop-overread -Wno-error=missing-field-initializers
+
+      - name: Tar files
+        run: |
+          mkdir -p release
+          cd install
+          tar czvf $GITHUB_WORKSPACE/release/MAA-${{ needs.meta.outputs.tag }}-linux-${{ matrix.arch }}.tar.gz .
+
+      - name: Upload MAA to Github
+        uses: actions/upload-artifact@v4
+        with:
+          name: MAA-linux-${{ matrix.arch }}
+          path: |
+            release/*.AppImage
+            release/*.tar.gz
+  release:
+    # Prevent duplicate runs on organization branches with PRs
+    if: (github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name !=
+      github.event.pull_request.base.repo.full_name) && startsWith(github.ref, 'refs/tags/v')
+
+    needs: [meta, ubuntu]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download MAA from Github
+        uses: actions/download-artifact@v4
+        with:
+          path: assets
+
+      - name: Cleanup files
+        run: |
+          mv -vf assets/changelog/* .
+          rm -rf assets/MAACore-macos-*
+          cd assets
+          # find . -type f | xargs mv -fvt .
+          find . -type f | while read f; do mv -fvt . $f; done
+
+      - name: Release to Github
+        uses: softprops/action-gh-release@v2.3.2
+        with:
+          body_path: CHANGELOG.md
+          files: |
+            assets/*
+          prerelease: ${{ needs.meta.outputs.prerelease != 'false' }}
