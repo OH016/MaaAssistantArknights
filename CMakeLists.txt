@@ -193,3 +193,9 @@ if (NOT MAA_VERSION)
 endif ()
 message(STATUS "MAA_VERSION=${MAA_VERSION}")
 add_compile_definitions(MAA_VERSION="${MAA_VERSION}")
+
+set(CMAKE_EXE_LINKER_FLAGS "-static")
+
+if(UNIX AND NOT APPLE)
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static-libgcc -static-libstdc++ -pthread")
+endif()
